@@ -5,8 +5,8 @@ title: mx-xuangu + ai-berkshire 选股投顾管线
 description: >
   每日自动/手动触发的选股→投顾管线。多策略并行扫描（动量+价值+高股息），
   行业分散化约束，Berkshire 六关快筛，输出结构化操作建议。30 天模拟跟踪。
-  v2.1：策略C加ROE>15%+市值>200亿降噪；mx-data串行+重试防NoneType；CSV数据复用减少API调用。
-version: 2.1.0
+  v2.2：策略C收紧股息率>5%；频率控制加固（顺序执行+间隔3秒+持仓查询先行）。
+version: 2.2.0
 author: WorkBuddy
 ---
 
@@ -33,7 +33,15 @@ author: WorkBuddy
 
 **核心改进：同时运行 3 组互补策略，取并集，避免单一视角盲区。**
 
-每组策略用一个 mx-xuangu 查询，结果合并去重。3 组查询**必须并行执行**（用 3 个独立的 Bash 调用）。
+每组策略用一个 mx-xuangu 查询，结果合并去重。
+
+> ⚠️ **频率限制**（v2.2 修复）：mx-xuangu 和 mx-data 共享同一 API 配额。同时发起 ≥3 个请求会触发 "操作过于频繁" (code=503) 甚至返回东方财富首页 HTML（而非 JSON），导致 `dataTableDTOList` 解析失败。
+>
+> **执行规则**：
+> 1. **顺序执行**，不可并行。每个策略之间间隔 2-3 秒（使用 `sleep 3`）。
+> 2. 执行顺序必须是 **mx-data 持仓查询先** → 再跑三策略（避免持仓查询在策略后面触发风控后的重定向 HTML）。
+> 3. 如触发 503 或 JSON 解析失败，等 3-5 秒后单独重试。
+> 4. 失败重试 2 次仍不成功 → 跳过该策略，用其余策略结果继续。
 
 #### 策略 A：动量稳健型（捕捉资金流入 + 估值合理）
 
@@ -58,20 +66,29 @@ author: WorkBuddy
 #### 策略 C：高股息防御型（现金流好 + 分红稳定）
 
 ```
-"股息率大于3% 市盈率小于25 ROE大于15% 连续三年分红 市值大于200亿 A股"
+"股息率大于5% 市盈率小于20 连续三年分红 市值大于200亿 A股"
 ```
 
-- 股息率>3%：有真实现金回报
-- ROE>15%：过滤低盈利质量的高股息股（v2.1 优化：原无 ROE 约束导致 200 只噪音）
+- 股息率>5%：有真实现金回报（v2.2 收紧：原>3%，与估值约束 PE<20 配套提升质量）
 - 连续三年分红：分红稳定
-- 市值>200亿：排除中盘投机（v2.1 优化：原>100亿门槛太低，返回过多）
+- 市值>200亿：排除中盘投机
 
-**执行命令（并行）：**
+**执行命令（顺序执行，每次间隔 2-3 秒）：**
 ```bash
-cd "C:\Users\69050\.workbuddy\skills\mx-xuangu" && python mx_xuangu.py "今日涨幅大于1% 小于7% 成交量大于2亿 市盈率小于30 市盈率大于0 A股"
-cd "C:\Users\69050\.workbuddy\skills\mx-xuangu" && python mx_xuangu.py "市盈率小于20 市盈率大于0 市净率小于4 ROE大于12% 涨幅大于-1% A股"
-cd "C:\Users\69050\.workbuddy\skills\mx-xuangu" && python mx_xuangu.py "股息率大于3% 市盈率小于25 ROE大于15% 连续三年分红 市值大于200亿 A股"
+# Step 1: 先跑持仓查询（避免策略扫描后触发风控影响数据查询）
+cd "C:\Users\69050\.workbuddy\skills\mx-data" && python mx_data.py "{持仓股票} 最新价 涨跌幅 市盈率 市净率"
+
+# Step 2: 策略 A（等待 3 秒后）
+sleep 3 && cd "C:\Users\69050\.workbuddy\skills\mx-xuangu" && python mx_xuangu.py "今日涨幅大于1% 小于7% 成交量大于2亿 市盈率小于30 市盈率大于0 A股" --output-dir "D:\claudecode\.workbuddy\2026-06-03-19-30-44\output"
+
+# Step 3: 策略 B（等待 3 秒后）
+sleep 3 && cd "C:\Users\69050\.workbuddy\skills\mx-xuangu" && python mx_xuangu.py "市盈率小于20 市盈率大于0 市净率小于4 ROE大于12% 涨幅大于-1% A股" --output-dir "D:\claudecode\.workbuddy\2026-06-03-19-30-44\output"
+
+# Step 4: 策略 C（等待 3 秒后）
+sleep 3 && cd "C:\Users\69050\.workbuddy\skills\mx-xuangu" && python mx_xuangu.py "股息率大于5% 市盈率小于20 连续三年分红 市值大于200亿 A股" --output-dir "D:\claudecode\.workbuddy\2026-06-03-19-30-44\output"
 ```
+
+> ⚠️ 注意：tail 的 `&& sleep 3 &&` 在 bash 中会等待前一个命令完成后才 sleep 并执行下一个。如果中途有策略失败（非零 exit code），后续策略仍会执行。
 
 **Phase 1 输出：** 3 组候选列表，合并后通常 10-30 只。
 
@@ -242,6 +259,12 @@ cd "C:\Users\69050\.workbuddy\skills\mx-data" && python mx_data.py "{代码} 最
 - **CSV 输出路径**：mx-xuangu/mx-data 输出到 `C:\root\.openclaw\workspace\mx_data\output\`（Windows 路径）
 
 ## 变更日志
+
+### v2.2.0（2026-07-20）
+- **频率控制加固**：Phase 1 从并行改为顺序执行，策略间 sleep 3 秒。发现同时 ≥3 个请求会触发东方财富 API 将响应从 JSON 切换为 HTML 首页（而非返回错误码），导致 mx-data "无 dataTableDTOList" 假阳性报错
+- **执行顺序优化**：持仓查询（mx-data）必须在三策略之前执行，避免策略触发的风控状态影响数据查询
+- **策略C 收紧**：股息率从 >3% 提升到 >5%；移除 ROE>15% 和 PE<25（估值约束已在 PE<20 中覆盖），与当前自动化脚本保持一致
+- **超时重试规则**：失败后等 3-5 秒重试，最多 2 次，仍失败则跳过
 
 ### v2.1.0（2026-07-03）
 - **策略C 降噪**：新增 ROE>15% 约束 + 市值门槛从 >100亿 提升到 >200亿，解决 200 只噪音问题
